@@ -1,0 +1,8 @@
+/.claude/
+/.idea/
+/.junie/
+
+
+# Added by cargo
+
+/target
