@@ -92,6 +92,7 @@ fn main() -> ExitCode {
         }
 
         match socket.recv_from(&mut response) {
+            Ok((size, source)) => {
                 if source != server
                     || size < 12
                     || u16::from_be_bytes([response[0], response[1]]) != id
