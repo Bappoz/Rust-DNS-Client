@@ -1,4 +1,4 @@
-use super::name::encode_qname;
+use super::name::{ParseError, encode_qname};
 
 pub const QTYPE_MX: u16 = 15;
 pub const QCLASS_IN: u16 = 1;
@@ -57,6 +57,25 @@ impl Header {
         buf[10..12].copy_from_slice(&self.arcount.to_be_bytes());
         buf
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() < 12 {
+            return Err(ParseError::TruncatedHeader { length: bytes.len() });
+        }
+
+        Ok(Header {
+            id: u16::from_be_bytes([bytes[0], bytes[1]]),
+            flags: u16::from_be_bytes([bytes[2], bytes[3]]),
+            qdcount: u16::from_be_bytes([bytes[4], bytes[5]]),
+            ancount: u16::from_be_bytes([bytes[6], bytes[7]]),
+            nscount: u16::from_be_bytes([bytes[8], bytes[9]]),
+            arcount: u16::from_be_bytes([bytes[10], bytes[11]]),
+        })
+    }
+
+    pub fn rcode(&self) -> u16 {
+        self.flags & 0x000F
+    }
 }
 
 #[cfg(test)]
@@ -70,6 +89,30 @@ mod tests {
             header.to_bytes(),
             [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn parses_response_header() {
+        let header = Header::from_bytes(&[
+            0x12, 0x34, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ])
+        .unwrap();
+
+        assert_eq!(header.id, 0x1234);
+        assert_eq!(header.flags, 0x8183);
+        assert_eq!(header.qdcount, 1);
+        assert_eq!(header.ancount, 0);
+        assert_eq!(header.nscount, 0);
+        assert_eq!(header.arcount, 0);
+        assert_eq!(header.rcode(), 3);
+    }
+
+    #[test]
+    fn rejects_truncated_header() {
+        assert!(matches!(
+            Header::from_bytes(&[0; 11]),
+            Err(ParseError::TruncatedHeader { length: 11 })
+        ));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::env;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dns::message::{Header, Question};
 use dns::txid::Rng;
@@ -66,11 +66,6 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(e) = socket.set_read_timeout(Some(Duration::from_secs(2))) {
-        eprintln!("nao foi possivel configurar o timeout de leitura: {e}");
-        return ExitCode::FAILURE;
-    }
-
     eprintln!(
         "[debug] servidor={} txid=0x{id:04x} pacote ({} bytes): {}",
         args.server_ip,
@@ -91,23 +86,51 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
 
-        match socket.recv_from(&mut response) {
-            Ok((size, source)) => {
-                if source != server
-                    || size < 12
-                    || u16::from_be_bytes([response[0], response[1]]) != id
-                {
-                    continue;
-                }
-                eprintln!(
-                    "[debug] resposta recebida na tentativa {attempt} de {source} ({size} bytes)"
-                );
-                return ExitCode::SUCCESS;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(e) => {
-                eprintln!("falha ao receber resposta DNS: {e}");
+            if let Err(e) = socket.set_read_timeout(Some(remaining)) {
+                eprintln!("nao foi possivel configurar o timeout de leitura: {e}");
                 return ExitCode::FAILURE;
+            }
+
+            match socket.recv_from(&mut response) {
+                Ok((size, source)) => {
+                    if source != server || size < 12 {
+                        continue;
+                    }
+
+                    let header = match Header::from_bytes(&response[..size]) {
+                        Ok(header) => header,
+                        Err(_) => continue,
+                    };
+                    if header.id != id {
+                        continue;
+                    }
+
+                    if header.rcode() == 3 {
+                        println!("Dominio {} nao encontrado", args.domain);
+                        return ExitCode::SUCCESS;
+                    }
+                    if header.rcode() != 0 {
+                        continue;
+                    }
+
+                    eprintln!(
+                        "[debug] resposta recebida na tentativa {attempt} de {source} ({size} bytes)"
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("falha ao receber resposta DNS: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
