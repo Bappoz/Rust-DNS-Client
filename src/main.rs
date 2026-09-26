@@ -135,9 +135,6 @@ fn main() -> ExitCode {
         }
     }
 
-    println!(
-        "Nao foi possível coletar entrada MX para {}",
-        args.domain
-    );
+    println!("Nao foi possível coletar entrada MX para {}", args.domain);
     ExitCode::FAILURE
 }

@@ -60,7 +60,9 @@ impl Header {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
         if bytes.len() < 12 {
-            return Err(ParseError::TruncatedHeader { length: bytes.len() });
+            return Err(ParseError::TruncatedHeader {
+                length: bytes.len(),
+            });
         }
 
         Ok(Header {
@@ -87,7 +89,9 @@ mod tests {
         let header = Header::new_query(0x1234);
         assert_eq!(
             header.to_bytes(),
-            [0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            [
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
         );
     }
 
@@ -120,7 +124,9 @@ mod tests {
         let q = Question::new("unb.br").unwrap();
         assert_eq!(
             q.to_bytes(),
-            vec![3, b'u', b'n', b'b', 2, b'b', b'r', 0, 0x00, 0x0F, 0x00, 0x01]
+            vec![
+                3, b'u', b'n', b'b', 2, b'b', b'r', 0, 0x00, 0x0F, 0x00, 0x01
+            ]
         );
     }
 }
