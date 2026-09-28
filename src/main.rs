@@ -6,7 +6,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use dns::message::{Header, Question};
+use dns::message::{Header, Question, parse_mx_answer};
 use dns::txid::Rng;
 
 struct Args {
@@ -80,7 +80,7 @@ fn main() -> ExitCode {
     let mut response = [0u8; 512];
     // Reenvia o mesmo pacote e TXID: simplifica a correlacao e segue o padrao
     // comum de resolvers; um novo TXID evitaria aceitar respostas atrasadas.
-    for attempt in 1..=3 {
+    for _attempt in 1..=3 {
         if let Err(e) = socket.send_to(&packet, server) {
             eprintln!("falha ao enviar consulta DNS: {e}");
             return ExitCode::FAILURE;
@@ -107,7 +107,7 @@ fn main() -> ExitCode {
                         Ok(header) => header,
                         Err(_) => continue,
                     };
-if header.id != id || header.flags & 0x8000 == 0 {
+                    if header.id != id || (header.flags & 0x8000) == 0 {
                         continue;
                     }
 
@@ -119,10 +119,20 @@ if header.id != id || header.flags & 0x8000 == 0 {
                         continue;
                     }
 
-                    eprintln!(
-                        "[debug] resposta recebida na tentativa {attempt} de {source} ({size} bytes)"
-                    );
-                    return ExitCode::SUCCESS;
+                    match parse_mx_answer(&response[..size], &header) {
+                        Ok(Some(exchange)) => {
+                            println!("{} <> {exchange}", args.domain);
+                            return ExitCode::SUCCESS;
+                        }
+                        Ok(None) => {
+                            println!("Dominio {} nao possui entrada MX", args.domain);
+                            return ExitCode::FAILURE;
+                        }
+                        Err(error) => {
+                            eprintln!("[debug] resposta DNS malformada: {error}");
+                            continue;
+                        }
+                    }
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
                     break;
