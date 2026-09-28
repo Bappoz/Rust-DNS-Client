@@ -80,7 +80,8 @@ fn main() -> ExitCode {
     let mut response = [0u8; 512];
     // Reenvia o mesmo pacote e TXID: simplifica a correlacao e segue o padrao
     // comum de resolvers; um novo TXID evitaria aceitar respostas atrasadas.
-    for _attempt in 1..=3 {
+    for attempt in 1..=3 {
+        eprintln!("[debug] tentativa {attempt}/3");
         if let Err(e) = socket.send_to(&packet, server) {
             eprintln!("falha ao enviar consulta DNS: {e}");
             return ExitCode::FAILURE;
@@ -113,7 +114,7 @@ fn main() -> ExitCode {
 
                     if header.rcode() == 3 {
                         println!("Dominio {} nao encontrado", args.domain);
-                        return ExitCode::SUCCESS;
+                        return ExitCode::FAILURE;
                     }
                     if header.rcode() != 0 {
                         continue;

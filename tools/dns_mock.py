@@ -1,8 +1,8 @@
 """Servidor UDP DNS minimo para testar o cliente localmente.
 
-Responde a qualquer consulta com um registro MX comprimido para
-``mail.unb.br``. O Transaction ID e a secao Question da consulta recebida sao
-reutilizados na resposta para exercitar a validacao do cliente.
+Responde com MX para ``unb.br``, sem MX para ``fga.unb.br`` e NXDOMAIN para
+o dominio inexistente usado no enunciado. O Transaction ID e a secao Question
+da consulta recebida sao reutilizados na resposta para exercitar o cliente.
 """
 
 import socket
@@ -24,22 +24,55 @@ MX_ANSWER = (
 )
 
 
-def make_response(request: bytes) -> bytes | None:
+def query_name(question: bytes) -> str | None:
+    """Decodifica o QNAME sem compressao enviado pelo cliente."""
+    labels = []
+    cursor = 0
+    while cursor < len(question):
+        label_length = question[cursor]
+        cursor += 1
+        if label_length == 0:
+            return ".".join(labels)
+        label_end = cursor + label_length
+        if label_end > len(question):
+            return None
+        labels.append(question[cursor:label_end].decode("ascii"))
+        cursor = label_end
+    return None
+
+
+def make_response(request: bytes) -> tuple[bytes, str] | None:
     if len(request) < 12:
         return None
 
     transaction_id = request[:2]
     question_count = request[4:6]
     question = request[12:]
-    return (
+    domain = query_name(question)
+    if domain is None:
+        return None
+
+    flags = b"\x81\x80"  # Resposta padrao, recursion available, NOERROR.
+    answer_count = b"\x00\x01"
+    answer = MX_ANSWER
+    if domain == "imagdaskdasdasj.br":
+        flags = b"\x81\x83"  # NXDOMAIN.
+        answer_count = b"\x00\x00"
+        answer = b""
+    elif domain == "fga.unb.br":
+        answer_count = b"\x00\x00"  # NOERROR, sem MX.
+        answer = b""
+
+    response = (
         transaction_id
-        + b"\x81\x80"  # Resposta padrao, recursion available, NOERROR.
+        + flags
         + question_count
-        + b"\x00\x01"  # ANCOUNT = 1
+        + answer_count
         + b"\x00\x00\x00\x00"  # NSCOUNT e ARCOUNT = 0
         + question
-        + MX_ANSWER
+        + answer
     )
+    return response, domain
 
 
 def main() -> None:
@@ -48,10 +81,11 @@ def main() -> None:
         print(f"Mock DNS escutando em udp://{HOST}:{PORT}")
         while True:
             request, client = sock.recvfrom(512)
-            response = make_response(request)
-            if response is None:
+            result = make_response(request)
+            if result is None:
                 continue
-            print(f"Consulta de {client}; respondendo com MX mail.unb.br")
+            response, domain = result
+            print(f"Consulta de {client} para {domain}")
             sock.sendto(response, client)
 
 
