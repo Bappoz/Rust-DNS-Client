@@ -107,7 +107,7 @@ fn main() -> ExitCode {
                         Ok(header) => header,
                         Err(_) => continue,
                     };
-                    if header.id != id {
+if header.id != id || header.flags & 0x8000 == 0 {
                         continue;
                     }
 
