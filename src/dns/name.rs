@@ -4,6 +4,9 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     TruncatedHeader { length: usize },
+    TruncatedQuestion { offset: usize },
+    TruncatedResourceRecord { offset: usize },
+    InvalidMxRdata { offset: usize, length: usize },
     OffsetOutOfBounds { offset: usize },
     TruncatedPointer { offset: usize },
     TruncatedLabel { offset: usize, length: usize },
@@ -17,6 +20,15 @@ impl fmt::Display for ParseError {
         match self {
             Self::TruncatedHeader { length } => {
                 write!(f, "header DNS truncado (tamanho {length})")
+            }
+            Self::TruncatedQuestion { offset } => {
+                write!(f, "question DNS truncada no offset {offset}")
+            }
+            Self::TruncatedResourceRecord { offset } => {
+                write!(f, "resource record DNS truncado no offset {offset}")
+            }
+            Self::InvalidMxRdata { offset, length } => {
+                write!(f, "RDATA MX invalido no offset {offset} (tamanho {length})")
             }
             Self::OffsetOutOfBounds { offset } => write!(f, "offset DNS invalido: {offset}"),
             Self::TruncatedPointer { offset } => {
