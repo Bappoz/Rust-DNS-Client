@@ -3,6 +3,7 @@ use std::fmt;
 /// Erros encontrados ao ler um nome codificado em uma mensagem DNS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
+    TruncatedHeader { length: usize },
     OffsetOutOfBounds { offset: usize },
     TruncatedPointer { offset: usize },
     TruncatedLabel { offset: usize, length: usize },
@@ -14,6 +15,9 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TruncatedHeader { length } => {
+                write!(f, "header DNS truncado (tamanho {length})")
+            }
             Self::OffsetOutOfBounds { offset } => write!(f, "offset DNS invalido: {offset}"),
             Self::TruncatedPointer { offset } => {
                 write!(f, "ponteiro DNS truncado no offset {offset}")
