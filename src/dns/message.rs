@@ -1,4 +1,4 @@
-use super::name::{ParseError, decode_name, encode_qname};
+use super::name::{ParseError, checked_offset, decode_name, encode_qname};
 
 pub const QTYPE_MX: u16 = 15;
 pub const QCLASS_IN: u16 = 1;
@@ -22,7 +22,7 @@ fn skip_questions(packet: &[u8], count: u16) -> Result<usize, ParseError> {
     for _ in 0..count {
         let (_, next_name_offset) = decode_name(packet, cursor)?;
         // QTYPE e QCLASS ocupam dois bytes cada apos o QNAME.
-        let question_end = next_name_offset + 4;
+        let question_end = checked_offset(next_name_offset, 4)?;
         if packet.get(next_name_offset..question_end).is_none() {
             return Err(ParseError::TruncatedQuestion {
                 offset: next_name_offset,
@@ -40,7 +40,7 @@ pub fn parse_resource_record(
     offset: usize,
 ) -> Result<(ResourceRecord, usize), ParseError> {
     let (name, fields_offset) = decode_name(packet, offset)?;
-    let fields_end = fields_offset + 10;
+    let fields_end = checked_offset(fields_offset, 10)?;
     let fields =
         packet
             .get(fields_offset..fields_end)
@@ -53,7 +53,7 @@ pub fn parse_resource_record(
     let ttl = u32::from_be_bytes([fields[4], fields[5], fields[6], fields[7]]);
     let rdlength = u16::from_be_bytes([fields[8], fields[9]]);
     let rdata_offset = fields_end;
-    let next_offset = rdata_offset + rdlength as usize;
+    let next_offset = checked_offset(rdata_offset, rdlength as usize)?;
 
     if packet.get(rdata_offset..next_offset).is_none() {
         return Err(ParseError::TruncatedResourceRecord {
@@ -95,7 +95,7 @@ pub fn parse_mx_answer(packet: &[u8], header: &Header) -> Result<Option<String>,
         }
 
         // MX RDATA: PREFERENCE (2 bytes) seguido por EXCHANGE (domain name).
-        let exchange_offset = record.rdata_offset + 2;
+        let exchange_offset = checked_offset(record.rdata_offset, 2)?;
         let (exchange, after_exchange) = decode_name(packet, exchange_offset)?;
         if after_exchange != next_offset {
             return Err(ParseError::InvalidMxRdata {
@@ -269,5 +269,97 @@ mod tests {
         let header = Header::from_bytes(&packet).unwrap();
 
         assert_eq!(parse_mx_answer(&packet, &header).unwrap(), None);
+    }
+    #[test]
+    fn rejects_truncated_question_name() {
+        let packet = [
+            // Header: uma Question e nenhuma Answer.
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // QNAME declara três bytes, mas não possui terminador.
+            3, b'u', b'n', b'b',
+        ];
+
+        let header = Header::from_bytes(&packet).unwrap();
+
+        assert!(parse_mx_answer(&packet, &header).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_resource_record_fields() {
+        let packet = [
+            // Header: nenhuma Question e uma Answer.
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // NAME raiz seguido por somente nove bytes.
+            0, 0x00, 0x0f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00,
+        ];
+
+        let header = Header::from_bytes(&packet).unwrap();
+
+        assert!(matches!(
+            parse_mx_answer(&packet, &header),
+            Err(ParseError::TruncatedResourceRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_rdlength_larger_than_remaining_packet() {
+        let packet = [
+            // Header: nenhuma Question e uma Answer.
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // NAME raiz.
+            0, // TYPE MX, CLASS IN, TTL 60.
+            0x00, 0x0f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c,
+            // Declara quatro bytes de RDATA.
+            0x00, 0x04, // Mas fornece somente dois.
+            0x00, 0x0a,
+        ];
+
+        let header = Header::from_bytes(&packet).unwrap();
+
+        assert!(matches!(
+            parse_mx_answer(&packet, &header),
+            Err(ParseError::TruncatedResourceRecord { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_mx_rdata_without_exchange() {
+        let packet = [
+            // Header: nenhuma Question e uma Answer.
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // NAME raiz.
+            0, // TYPE MX, CLASS IN, TTL 60.
+            0x00, 0x0f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c,
+            // RDLENGTH = 2, contendo somente PREFERENCE.
+            0x00, 0x02, 0x00, 0x0a,
+        ];
+
+        let header = Header::from_bytes(&packet).unwrap();
+
+        assert!(matches!(
+            parse_mx_answer(&packet, &header),
+            Err(ParseError::InvalidMxRdata { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_mx_exchange_outside_rdata() {
+        let packet = [
+            // Header: nenhuma Question e uma Answer.
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            // NAME raiz.
+            0, // TYPE MX, CLASS IN, TTL 60.
+            0x00, 0x0f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, // RDLENGTH = 4.
+            0x00, 0x04, // PREFERENCE e nome raiz.
+            0x00, 0x0a, 0, // Byte extra que não pertence ao EXCHANGE.
+            0xff,
+        ];
+
+        let header = Header::from_bytes(&packet).unwrap();
+
+        assert!(matches!(
+            parse_mx_answer(&packet, &header),
+            Err(ParseError::InvalidMxRdata { .. })
+        ));
     }
 }

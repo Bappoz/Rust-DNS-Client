@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 
 /// Erros encontrados ao ler um nome codificado em uma mensagem DNS.
@@ -13,6 +14,8 @@ pub enum ParseError {
     InvalidLabelTag { offset: usize, tag: u8 },
     PointerLoop,
     InvalidLabelEncoding,
+    TooManyPointerJumps { limit: usize },
+    OffsetOverflow { offset: usize, length: usize },
 }
 
 impl fmt::Display for ParseError {
@@ -48,11 +51,23 @@ impl fmt::Display for ParseError {
             }
             Self::PointerLoop => write!(f, "muitos saltos de ponteiro DNS (possivel ciclo)"),
             Self::InvalidLabelEncoding => write!(f, "label DNS nao e UTF-8 valido"),
+            Self::TooManyPointerJumps { limit } => {
+                write!(f, "nome DNS excedeu o limite de {limit} ponteiros")
+            }
+            Self::OffsetOverflow { offset, length } => {
+                write!(f, "overflow ao calcular offset DNS: {offset} + {length}")
+            }
         }
     }
 }
 
 impl std::error::Error for ParseError {}
+
+pub(crate) fn checked_offset(offset: usize, length: usize) -> Result<usize, ParseError> {
+    offset
+        .checked_add(length)
+        .ok_or(ParseError::OffsetOverflow { offset, length })
+}
 
 /// Decodifica um nome DNS, incluindo ponteiros de compressao do RFC 1035 §4.1.4.
 ///
@@ -70,6 +85,7 @@ pub fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), Pars
     let mut next_offset = None;
     let mut labels = Vec::new();
     let mut pointer_jumps = 0;
+    let mut visited_offsets = HashSet::new();
 
     loop {
         let length = *packet
@@ -78,23 +94,34 @@ pub fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), Pars
 
         match length {
             0 => {
-                let after_name = next_offset.unwrap_or(cursor + 1);
+                let after_name = match next_offset {
+                    Some(offset) => offset,
+                    None => checked_offset(cursor, 1)?,
+                };
                 return Ok((labels.join("."), after_name));
             }
             0xC0..=0xFF => {
+                let low_byte_offset = checked_offset(cursor, 1)?;
                 let low_byte = *packet
-                    .get(cursor + 1)
+                    .get(low_byte_offset)
                     .ok_or(ParseError::TruncatedPointer { offset: cursor })?;
                 let pointer = (((length & 0x3F) as usize) << 8) | low_byte as usize;
 
                 if pointer >= packet.len() {
                     return Err(ParseError::OffsetOutOfBounds { offset: pointer });
                 }
-                if pointer_jumps >= MAX_POINTER_JUMPS {
+                if !visited_offsets.insert(pointer) {
                     return Err(ParseError::PointerLoop);
                 }
+                if pointer_jumps >= MAX_POINTER_JUMPS {
+                    return Err(ParseError::TooManyPointerJumps {
+                        limit: MAX_POINTER_JUMPS,
+                    });
+                }
                 pointer_jumps += 1;
-                next_offset.get_or_insert(cursor + 2);
+                if next_offset.is_none() {
+                    next_offset = Some(checked_offset(cursor, 2)?);
+                }
                 cursor = pointer;
             }
             0x40..=0xBF => {
@@ -104,8 +131,8 @@ pub fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), Pars
                 });
             }
             label_length => {
-                let label_start = cursor + 1;
-                let label_end = label_start + label_length as usize;
+                let label_start = checked_offset(cursor, 1)?;
+                let label_end = checked_offset(label_start, label_length as usize)?;
                 let label =
                     packet
                         .get(label_start..label_end)
@@ -191,6 +218,66 @@ mod tests {
         assert_eq!(
             decode_name(&packet, 0),
             Err(ParseError::OffsetOutOfBounds { offset: 16 })
+        );
+    }
+
+    #[test]
+    fn rejects_name_without_terminator() {
+        let packet = [3, b'u', b'n', b'b'];
+
+        assert_eq!(
+            decode_name(&packet, 0),
+            Err(ParseError::OffsetOutOfBounds { offset: 4 })
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_pointer() {
+        let packet = [0xC0];
+
+        assert_eq!(
+            decode_name(&packet, 0),
+            Err(ParseError::TruncatedPointer { offset: 0 })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_label_tag() {
+        let packet = [0x40, 0];
+
+        assert_eq!(
+            decode_name(&packet, 0),
+            Err(ParseError::InvalidLabelTag {
+                offset: 0,
+                tag: 0x40,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_label() {
+        let packet = [1, 0xFF, 0];
+
+        assert_eq!(
+            decode_name(&packet, 0),
+            Err(ParseError::InvalidLabelEncoding)
+        );
+    }
+
+    #[test]
+    fn rejects_long_non_cyclic_pointer_chain() {
+        let mut packet = Vec::new();
+
+        for index in 0..21 {
+            let target = ((index + 1) * 2) as u8;
+            packet.extend_from_slice(&[0xC0, target]);
+        }
+
+        packet.push(0);
+
+        assert_eq!(
+            decode_name(&packet, 0),
+            Err(ParseError::TooManyPointerJumps { limit: 20 })
         );
     }
 }
