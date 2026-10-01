@@ -74,10 +74,16 @@ pub fn parse_resource_record(
     ))
 }
 
-/// Extrai o primeiro `EXCHANGE` de um registro MX na secao Answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxAnswer {
+    pub exchange: String,
+    pub ttl: u32,
+}
+
+/// Extrai o primeiro `EXCHANGE` e seu TTL de um registro MX na secao Answer.
 ///
 /// Retorna `Ok(None)` quando a secao Answer esta vazia ou nao possui MX.
-pub fn parse_mx_answer(packet: &[u8], header: &Header) -> Result<Option<String>, ParseError> {
+pub fn parse_mx_answer(packet: &[u8], header: &Header) -> Result<Option<MxAnswer>, ParseError> {
     let mut cursor = skip_questions(packet, header.qdcount)?;
 
     for _ in 0..header.ancount {
@@ -103,7 +109,10 @@ pub fn parse_mx_answer(packet: &[u8], header: &Header) -> Result<Option<String>,
                 length: record.rdlength as usize,
             });
         }
-        return Ok(Some(exchange));
+        return Ok(Some(MxAnswer {
+            exchange,
+            ttl: record.ttl,
+        }));
     }
 
     Ok(None)
@@ -252,7 +261,10 @@ mod tests {
 
         assert_eq!(
             parse_mx_answer(&packet, &header).unwrap(),
-            Some("mail.unb.br".into())
+            Some(MxAnswer {
+                exchange: "mail.unb.br".into(),
+                ttl: 60,
+            })
         );
     }
 
