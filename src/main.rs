@@ -6,6 +6,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use dns::cache::{DnsCache, unix_time_now};
+use dns::message::QTYPE_MX;
 use dns::message::{Header, Question, parse_mx_answer};
 use dns::txid::Rng;
 
@@ -57,6 +59,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    let mut cache = match DnsCache::open_default() {
+        Ok(cache) => cache,
+        Err(error) => {
+            eprintln!("[debug] cache DNS indisponivel: {error}");
+            None
+        }
+    };
+    if let Some(exchange) = cache
+        .as_mut()
+        .and_then(|cache| cache.get(&args.domain, QTYPE_MX, unix_time_now()))
+    {
+        eprintln!("[debug] resposta obtida do cache DNS");
+        println!("{} <> {exchange}", args.domain);
+        return ExitCode::SUCCESS;
+    }
 
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => socket,
@@ -121,8 +139,21 @@ fn main() -> ExitCode {
                     }
 
                     match parse_mx_answer(&response[..size], &header) {
-                        Ok(Some(exchange)) => {
-                            println!("{} <> {exchange}", args.domain);
+                        Ok(Some(answer)) => {
+                            if let Some(cache) = cache.as_mut()
+                                && let Err(error) = cache.insert(
+                                    &args.domain,
+                                    QTYPE_MX,
+                                    answer.exchange.clone(),
+                                    answer.ttl,
+                                    unix_time_now(),
+                                )
+                            {
+                                eprintln!(
+                                    "[debug] nao foi possivel atualizar o cache DNS: {error}"
+                                );
+                            }
+                            println!("{} <> {}", args.domain, answer.exchange);
                             return ExitCode::SUCCESS;
                         }
                         Ok(None) => {
