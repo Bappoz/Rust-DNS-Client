@@ -149,6 +149,7 @@ pub struct Header {
 }
 
 pub const FLAGS_RECURSIVE_QUERY: u16 = 0x0100;
+pub const FLAGS_TRUNCATED: u16 = 0x0200;
 
 impl Header {
     pub fn new_query(id: u16) -> Self {
@@ -193,6 +194,10 @@ impl Header {
     pub fn rcode(&self) -> u16 {
         self.flags & 0x000F
     }
+
+    pub fn is_truncated(&self) -> bool {
+        self.flags & FLAGS_TRUNCATED != 0
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +229,17 @@ mod tests {
         assert_eq!(header.nscount, 0);
         assert_eq!(header.arcount, 0);
         assert_eq!(header.rcode(), 3);
+        assert!(!header.is_truncated());
+    }
+
+    #[test]
+    fn detects_truncated_response() {
+        let header = Header::from_bytes(&[
+            0x12, 0x34, 0x83, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ])
+        .unwrap();
+
+        assert!(header.is_truncated());
     }
 
     #[test]

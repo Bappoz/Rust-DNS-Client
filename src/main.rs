@@ -1,8 +1,8 @@
 mod dns;
 
 use std::env;
-use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{Error, ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,25 @@ use dns::txid::Rng;
 struct Args {
     domain: String,
     server_ip: String,
+}
+
+fn query_over_tcp(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>> {
+    let timeout = Duration::from_secs(2);
+    let mut stream = TcpStream::connect_timeout(&server, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+
+    let length = u16::try_from(packet.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "consulta DNS excede 65535 bytes"))?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(packet)?;
+
+    let mut length_bytes = [0u8; 2];
+    stream.read_exact(&mut length_bytes)?;
+    let response_length = u16::from_be_bytes(length_bytes) as usize;
+    let mut response = vec![0u8; response_length];
+    stream.read_exact(&mut response)?;
+    Ok(response)
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -130,6 +149,30 @@ fn main() -> ExitCode {
                         continue;
                     }
 
+                    let response_packet = if header.is_truncated() {
+                        eprintln!("[debug] resposta UDP truncada; repetindo consulta via TCP");
+                        match query_over_tcp(server, &packet) {
+                            Ok(response) => response,
+                            Err(error) => {
+                                eprintln!("falha na consulta DNS via TCP: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else {
+                        response[..size].to_vec()
+                    };
+
+                    let header = match Header::from_bytes(&response_packet) {
+                        Ok(header) => header,
+                        Err(error) => {
+                            eprintln!("[debug] resposta DNS via TCP malformada: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    if header.id != id || (header.flags & 0x8000) == 0 {
+                        eprintln!("[debug] resposta DNS via TCP nao corresponde a consulta");
+                        return ExitCode::FAILURE;
+                    }
                     if header.rcode() == 3 {
                         println!("Dominio {} nao encontrado", args.domain);
                         return ExitCode::FAILURE;
@@ -138,7 +181,7 @@ fn main() -> ExitCode {
                         continue;
                     }
 
-                    match parse_mx_answer(&response[..size], &header) {
+                    match parse_mx_answer(&response_packet, &header) {
                         Ok(Some(answer)) => {
                             if let Some(cache) = cache.as_mut()
                                 && let Err(error) = cache.insert(
@@ -179,4 +222,39 @@ fn main() -> ExitCode {
 
     println!("Nao foi possível coletar entrada MX para {}", args.domain);
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn tcp_query_uses_dns_length_prefix() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.local_addr().unwrap();
+        let request = vec![0x12, 0x34, 0x01, 0x00];
+        let expected_response = vec![0x12, 0x34, 0x81, 0x80];
+        let expected_request_on_server = request.clone();
+        let response_from_server = expected_response.clone();
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length_bytes = [0u8; 2];
+            stream.read_exact(&mut length_bytes).unwrap();
+            let request_length = u16::from_be_bytes(length_bytes) as usize;
+            let mut received_request = vec![0u8; request_length];
+            stream.read_exact(&mut received_request).unwrap();
+            assert_eq!(received_request, expected_request_on_server);
+
+            stream
+                .write_all(&(response_from_server.len() as u16).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response_from_server).unwrap();
+        });
+
+        assert_eq!(query_over_tcp(server, &request).unwrap(), expected_response);
+        server_thread.join().unwrap();
+    }
 }
