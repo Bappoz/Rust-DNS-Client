@@ -155,16 +155,13 @@ pub fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), Pars
 pub fn encode_qname(domain: &str) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for label in domain.split('.').filter(|s| !s.is_empty()) {
-        if label.len() > 63 {
-            return Err(format!("label '{label}' excede 63 bytes"));
+        let ascii_label = idna::domain_to_ascii(label)
+            .map_err(|error| format!("label '{label}' invalido para IDN: {error}"))?;
+        if ascii_label.len() > 63 {
+            return Err(format!("label '{label}' excede 63 bytes após Punycode"));
         }
-        if !label.is_ascii() {
-            return Err(format!(
-                "label '{label}' have non-ascii chars (IDN not supported)"
-            ));
-        }
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
+        out.push(ascii_label.len() as u8);
+        out.extend_from_slice(ascii_label.as_bytes());
     }
     out.push(0);
     Ok(out)
@@ -188,6 +185,17 @@ mod tests {
         assert_eq!(
             encode_qname("unb.br").unwrap(),
             encode_qname("unb.br.").unwrap()
+        );
+    }
+
+    #[test]
+    fn encodes_internationalized_label_as_punycode() {
+        assert_eq!(
+            encode_qname("café.example").unwrap(),
+            vec![
+                11, b'x', b'n', b'-', b'-', b'c', b'a', b'f', b'-', b'd', b'm', b'a', 7, b'e',
+                b'x', b'a', b'm', b'p', b'l', b'e', 0
+            ]
         );
     }
 
