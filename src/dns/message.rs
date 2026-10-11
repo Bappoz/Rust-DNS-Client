@@ -1,7 +1,66 @@
 use super::name::{ParseError, checked_offset, decode_name, encode_qname};
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::str::FromStr;
 
+pub const QTYPE_A: u16 = 1;
+pub const QTYPE_NS: u16 = 2;
+pub const QTYPE_CNAME: u16 = 5;
 pub const QTYPE_MX: u16 = 15;
+pub const QTYPE_TXT: u16 = 16;
+pub const QTYPE_AAAA: u16 = 28;
 pub const QCLASS_IN: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordType {
+    A,
+    NS,
+    Cname,
+    MX,
+    Txt,
+    Aaaa,
+}
+
+impl RecordType {
+    pub fn code(self) -> u16 {
+        match self {
+            Self::A => QTYPE_A,
+            Self::NS => QTYPE_NS,
+            Self::Cname => QTYPE_CNAME,
+            Self::MX => QTYPE_MX,
+            Self::Txt => QTYPE_TXT,
+            Self::Aaaa => QTYPE_AAAA,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::A => "A",
+            Self::NS => "NS",
+            Self::Cname => "CNAME",
+            Self::MX => "MX",
+            Self::Txt => "TXT",
+            Self::Aaaa => "AAAA",
+        }
+    }
+}
+
+impl FromStr for RecordType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "A" => Ok(Self::A),
+            "NS" => Ok(Self::NS),
+            "CNAME" => Ok(Self::Cname),
+            "MX" => Ok(Self::MX),
+            "TXT" => Ok(Self::Txt),
+            "AAAA" => Ok(Self::Aaaa),
+            _ => Err(format!(
+                "tipo DNS invalido: {value} (use A, AAAA, CNAME, NS, TXT ou MX)"
+            )),
+        }
+    }
+}
 
 /// Um Resource Record da mensagem DNS. `rdata_offset` aponta para o inicio do
 /// RDATA no pacote original, necessario pois nomes dentro dele podem usar
@@ -75,47 +134,128 @@ pub fn parse_resource_record(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MxAnswer {
-    pub exchange: String,
+pub struct RecordAnswer {
+    pub value: String,
     pub ttl: u32,
 }
 
-/// Extrai o primeiro `EXCHANGE` e seu TTL de um registro MX na secao Answer.
+/// Extrai todos os registros do tipo solicitado na secao Answer.
 ///
-/// Retorna `Ok(None)` quando a secao Answer esta vazia ou nao possui MX.
-pub fn parse_mx_answer(packet: &[u8], header: &Header) -> Result<Option<MxAnswer>, ParseError> {
+/// O valor retornado usa a representacao textual do respectivo tipo DNS.
+pub fn parse_answers(
+    packet: &[u8],
+    header: &Header,
+    record_type: RecordType,
+) -> Result<Vec<RecordAnswer>, ParseError> {
     let mut cursor = skip_questions(packet, header.qdcount)?;
+    let mut answers = Vec::new();
 
     for _ in 0..header.ancount {
         let (record, next_offset) = parse_resource_record(packet, cursor)?;
         cursor = next_offset;
 
-        if record.rr_type != QTYPE_MX {
+        if record.rr_type != record_type.code() {
             continue;
         }
-        if record.rdlength < 3 {
-            return Err(ParseError::InvalidMxRdata {
-                offset: record.rdata_offset,
-                length: record.rdlength as usize,
-            });
-        }
 
-        // MX RDATA: PREFERENCE (2 bytes) seguido por EXCHANGE (domain name).
-        let exchange_offset = checked_offset(record.rdata_offset, 2)?;
-        let (exchange, after_exchange) = decode_name(packet, exchange_offset)?;
-        if after_exchange != next_offset {
-            return Err(ParseError::InvalidMxRdata {
-                offset: record.rdata_offset,
-                length: record.rdlength as usize,
-            });
-        }
-        return Ok(Some(MxAnswer {
-            exchange,
+        answers.push(RecordAnswer {
+            value: decode_record_value(packet, &record, next_offset, record_type)?,
             ttl: record.ttl,
-        }));
+        });
     }
 
-    Ok(None)
+    Ok(answers)
+}
+
+fn decode_record_value(
+    packet: &[u8],
+    record: &ResourceRecord,
+    rdata_end: usize,
+    record_type: RecordType,
+) -> Result<String, ParseError> {
+    let invalid_rdata = || ParseError::InvalidRecordRdata {
+        rr_type: record.rr_type,
+        offset: record.rdata_offset,
+        length: record.rdlength as usize,
+    };
+
+    match record_type {
+        RecordType::A => {
+            let bytes = packet
+                .get(record.rdata_offset..rdata_end)
+                .ok_or_else(invalid_rdata)?;
+            let address: [u8; 4] = bytes.try_into().map_err(|_| invalid_rdata())?;
+            Ok(Ipv4Addr::from(address).to_string())
+        }
+        RecordType::Aaaa => {
+            let bytes = packet
+                .get(record.rdata_offset..rdata_end)
+                .ok_or_else(invalid_rdata)?;
+            let address: [u8; 16] = bytes.try_into().map_err(|_| invalid_rdata())?;
+            Ok(Ipv6Addr::from(address).to_string())
+        }
+        RecordType::Cname | RecordType::NS => {
+            let (name, after_name) = decode_name(packet, record.rdata_offset)?;
+            if after_name != rdata_end {
+                return Err(invalid_rdata());
+            }
+            Ok(name)
+        }
+        RecordType::MX => {
+            if record.rdlength < 3 {
+                return Err(ParseError::InvalidMxRdata {
+                    offset: record.rdata_offset,
+                    length: record.rdlength as usize,
+                });
+            }
+            let exchange_offset = checked_offset(record.rdata_offset, 2)?;
+            let (exchange, after_exchange) = decode_name(packet, exchange_offset)?;
+            if after_exchange != rdata_end {
+                return Err(ParseError::InvalidMxRdata {
+                    offset: record.rdata_offset,
+                    length: record.rdlength as usize,
+                });
+            }
+            Ok(exchange)
+        }
+        RecordType::Txt => {
+            let mut cursor = record.rdata_offset;
+            let mut strings = Vec::new();
+            while cursor < rdata_end {
+                let length = packet[cursor] as usize;
+                cursor = checked_offset(cursor, 1)?;
+                let string_end = checked_offset(cursor, length)?;
+                if string_end > rdata_end {
+                    return Err(invalid_rdata());
+                }
+                strings.push(format_txt_string(&packet[cursor..string_end]));
+                cursor = string_end;
+            }
+            if strings.is_empty() {
+                return Err(invalid_rdata());
+            }
+            Ok(strings.join(" "))
+        }
+    }
+}
+
+fn format_txt_string(bytes: &[u8]) -> String {
+    let mut value = String::from("\"");
+    for byte in bytes {
+        match byte {
+            b'"' => value.push_str("\\\""),
+            b'\\' => value.push_str("\\\\"),
+            0x20..=0x7e => value.push(char::from(*byte)),
+            _ => {
+                value.push('\\');
+                value.push(char::from(b'0' + byte / 100));
+                value.push(char::from(b'0' + (byte / 10) % 10));
+                value.push(char::from(b'0' + byte % 10));
+            }
+        }
+    }
+    value.push('"');
+    value
 }
 
 pub struct Question {
@@ -131,8 +271,12 @@ impl Question {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.to_bytes_for(RecordType::MX)
+    }
+
+    pub fn to_bytes_for(&self, record_type: RecordType) -> Vec<u8> {
         let mut buf = self.qname.clone();
-        buf.extend_from_slice(&QTYPE_MX.to_be_bytes());
+        buf.extend_from_slice(&record_type.code().to_be_bytes());
         buf.extend_from_slice(&QCLASS_IN.to_be_bytes());
         buf
     }
@@ -204,6 +348,30 @@ impl Header {
 mod tests {
     use super::*;
 
+    fn response_with_rdata(record_type: RecordType, rdatas: &[&[u8]]) -> (Vec<u8>, Header) {
+        let mut header = Header::new_query(0x1234);
+        header.flags = 0x8180;
+        header.ancount = rdatas.len().try_into().unwrap();
+        let mut packet = header.to_bytes().to_vec();
+        packet.extend_from_slice(
+            &Question::new("example.com")
+                .unwrap()
+                .to_bytes_for(record_type),
+        );
+
+        for rdata in rdatas {
+            packet.extend_from_slice(&[0xc0, 0x0c]);
+            packet.extend_from_slice(&record_type.code().to_be_bytes());
+            packet.extend_from_slice(&QCLASS_IN.to_be_bytes());
+            packet.extend_from_slice(&60u32.to_be_bytes());
+            packet.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            packet.extend_from_slice(rdata);
+        }
+
+        let header = Header::from_bytes(&packet).unwrap();
+        (packet, header)
+    }
+
     #[test]
     fn header_bytes_rfc() {
         let header = Header::new_query(0x1234);
@@ -262,6 +430,97 @@ mod tests {
     }
 
     #[test]
+    fn question_encodes_requested_record_type() {
+        let question = Question::new("unb.br").unwrap();
+        for (record_type, code) in [
+            (RecordType::A, QTYPE_A),
+            (RecordType::NS, QTYPE_NS),
+            (RecordType::Cname, QTYPE_CNAME),
+            (RecordType::MX, QTYPE_MX),
+            (RecordType::Txt, QTYPE_TXT),
+            (RecordType::Aaaa, QTYPE_AAAA),
+        ] {
+            assert!(
+                question
+                    .to_bytes_for(record_type)
+                    .ends_with(&[code.to_be_bytes(), QCLASS_IN.to_be_bytes()].concat())
+            );
+        }
+    }
+
+    #[test]
+    fn parses_all_a_records() {
+        let first = [192, 0, 2, 1];
+        let second = [198, 51, 100, 2];
+        let (packet, header) = response_with_rdata(RecordType::A, &[&first, &second]);
+
+        let answers = parse_answers(&packet, &header, RecordType::A).unwrap();
+
+        assert_eq!(
+            answers
+                .iter()
+                .map(|answer| answer.value.as_str())
+                .collect::<Vec<_>>(),
+            ["192.0.2.1", "198.51.100.2"]
+        );
+    }
+
+    #[test]
+    fn parses_aaaa_record() {
+        let address = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let (packet, header) = response_with_rdata(RecordType::Aaaa, &[&address]);
+
+        let answers = parse_answers(&packet, &header, RecordType::Aaaa).unwrap();
+
+        assert_eq!(answers[0].value, "2001:db8::1");
+    }
+
+    #[test]
+    fn parses_cname_and_ns_names() {
+        let name = [0xc0, 0x0c];
+        for record_type in [RecordType::Cname, RecordType::NS] {
+            let (packet, header) = response_with_rdata(record_type, &[&name]);
+
+            let answers = parse_answers(&packet, &header, record_type).unwrap();
+
+            assert_eq!(answers[0].value, "example.com");
+        }
+    }
+
+    #[test]
+    fn parses_txt_character_strings() {
+        let txt = [3, b'f', b'o', b'o', 3, b'b', b'a', b'r'];
+        let (packet, header) = response_with_rdata(RecordType::Txt, &[&txt]);
+
+        let answers = parse_answers(&packet, &header, RecordType::Txt).unwrap();
+
+        assert_eq!(answers[0].value, "\"foo\" \"bar\"");
+    }
+
+    #[test]
+    fn rejects_invalid_a_and_txt_rdata() {
+        let invalid_a = [192, 0, 2];
+        let (packet, header) = response_with_rdata(RecordType::A, &[&invalid_a]);
+        assert!(matches!(
+            parse_answers(&packet, &header, RecordType::A),
+            Err(ParseError::InvalidRecordRdata {
+                rr_type: QTYPE_A,
+                ..
+            })
+        ));
+
+        let invalid_txt = [4, b'f', b'o', b'o'];
+        let (packet, header) = response_with_rdata(RecordType::Txt, &[&invalid_txt]);
+        assert!(matches!(
+            parse_answers(&packet, &header, RecordType::Txt),
+            Err(ParseError::InvalidRecordRdata {
+                rr_type: QTYPE_TXT,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn extracts_mx_exchange_from_answer() {
         let packet = [
             // Header: 1 question, 1 answer, NOERROR.
@@ -276,11 +535,11 @@ mod tests {
         let header = Header::from_bytes(&packet).unwrap();
 
         assert_eq!(
-            parse_mx_answer(&packet, &header).unwrap(),
-            Some(MxAnswer {
-                exchange: "mail.unb.br".into(),
+            parse_answers(&packet, &header, RecordType::MX).unwrap(),
+            vec![RecordAnswer {
+                value: "mail.unb.br".into(),
                 ttl: 60,
-            })
+            }]
         );
     }
 
@@ -296,7 +555,11 @@ mod tests {
         ];
         let header = Header::from_bytes(&packet).unwrap();
 
-        assert_eq!(parse_mx_answer(&packet, &header).unwrap(), None);
+        assert!(
+            parse_answers(&packet, &header, RecordType::MX)
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn rejects_truncated_question_name() {
@@ -309,7 +572,7 @@ mod tests {
 
         let header = Header::from_bytes(&packet).unwrap();
 
-        assert!(parse_mx_answer(&packet, &header).is_err());
+        assert!(parse_answers(&packet, &header, RecordType::MX).is_err());
     }
 
     #[test]
@@ -324,7 +587,7 @@ mod tests {
         let header = Header::from_bytes(&packet).unwrap();
 
         assert!(matches!(
-            parse_mx_answer(&packet, &header),
+            parse_answers(&packet, &header, RecordType::MX),
             Err(ParseError::TruncatedResourceRecord { .. })
         ));
     }
@@ -345,7 +608,7 @@ mod tests {
         let header = Header::from_bytes(&packet).unwrap();
 
         assert!(matches!(
-            parse_mx_answer(&packet, &header),
+            parse_answers(&packet, &header, RecordType::MX),
             Err(ParseError::TruncatedResourceRecord { .. })
         ));
     }
@@ -365,7 +628,7 @@ mod tests {
         let header = Header::from_bytes(&packet).unwrap();
 
         assert!(matches!(
-            parse_mx_answer(&packet, &header),
+            parse_answers(&packet, &header, RecordType::MX),
             Err(ParseError::InvalidMxRdata { .. })
         ));
     }
@@ -386,7 +649,7 @@ mod tests {
         let header = Header::from_bytes(&packet).unwrap();
 
         assert!(matches!(
-            parse_mx_answer(&packet, &header),
+            parse_answers(&packet, &header, RecordType::MX),
             Err(ParseError::InvalidMxRdata { .. })
         ));
     }

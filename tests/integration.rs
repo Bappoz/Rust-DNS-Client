@@ -51,6 +51,24 @@ fn mx_record_found() {
 
 #[test]
 #[ignore = "requer rede"]
+fn a_record_found() {
+    let output = run_client(&["unb.br", PUBLIC_RESOLVER, "--type", "A"]);
+    let out = stdout(&output);
+
+    assert!(output.status.success(), "stdout: {out}");
+    assert!(
+        out.lines().any(|line| line.starts_with("unb.br A ")),
+        "stdout: {out}"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requer rede"]
 fn nxdomain() {
     let output = run_client(&["imagdaskdasdasj.br", PUBLIC_RESOLVER]);
 

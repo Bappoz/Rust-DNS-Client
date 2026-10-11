@@ -4,18 +4,47 @@ use std::fmt;
 /// Erros encontrados ao ler um nome codificado em uma mensagem DNS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
-    TruncatedHeader { length: usize },
-    TruncatedQuestion { offset: usize },
-    TruncatedResourceRecord { offset: usize },
-    InvalidMxRdata { offset: usize, length: usize },
-    OffsetOutOfBounds { offset: usize },
-    TruncatedPointer { offset: usize },
-    TruncatedLabel { offset: usize, length: usize },
-    InvalidLabelTag { offset: usize, tag: u8 },
+    TruncatedHeader {
+        length: usize,
+    },
+    TruncatedQuestion {
+        offset: usize,
+    },
+    TruncatedResourceRecord {
+        offset: usize,
+    },
+    InvalidMxRdata {
+        offset: usize,
+        length: usize,
+    },
+    InvalidRecordRdata {
+        rr_type: u16,
+        offset: usize,
+        length: usize,
+    },
+    OffsetOutOfBounds {
+        offset: usize,
+    },
+    TruncatedPointer {
+        offset: usize,
+    },
+    TruncatedLabel {
+        offset: usize,
+        length: usize,
+    },
+    InvalidLabelTag {
+        offset: usize,
+        tag: u8,
+    },
     PointerLoop,
     InvalidLabelEncoding,
-    TooManyPointerJumps { limit: usize },
-    OffsetOverflow { offset: usize, length: usize },
+    TooManyPointerJumps {
+        limit: usize,
+    },
+    OffsetOverflow {
+        offset: usize,
+        length: usize,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -33,6 +62,14 @@ impl fmt::Display for ParseError {
             Self::InvalidMxRdata { offset, length } => {
                 write!(f, "RDATA MX invalido no offset {offset} (tamanho {length})")
             }
+            Self::InvalidRecordRdata {
+                rr_type,
+                offset,
+                length,
+            } => write!(
+                f,
+                "RDATA DNS tipo {rr_type} invalido no offset {offset} (tamanho {length})"
+            ),
             Self::OffsetOutOfBounds { offset } => write!(f, "offset DNS invalido: {offset}"),
             Self::TruncatedPointer { offset } => {
                 write!(f, "ponteiro DNS truncado no offset {offset}")
