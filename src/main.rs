@@ -14,6 +14,16 @@ use dns::txid::Rng;
 struct Args {
     domain: String,
     server_ip: String,
+    verbose: bool,
+}
+
+// Logs de diagnostico so aparecem com -v/--verbose; erros reais usam eprintln! direto.
+macro_rules! debug_log {
+    ($args:expr, $($arg:tt)*) => {
+        if $args.verbose {
+            eprintln!($($arg)*);
+        }
+    };
 }
 
 fn query_over_tcp(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -36,14 +46,19 @@ fn query_over_tcp(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>>
 }
 
 fn parse_args() -> Result<Args, String> {
-    let argv: Vec<String> = env::args().collect();
-    match argv.as_slice() {
-        [_prog, domain, server_ip] => Ok(Args {
+    let mut argv = env::args();
+    let prog = argv.next().unwrap_or_else(|| "my-client".to_string());
+    let (flags, positional): (Vec<String>, Vec<String>) =
+        argv.partition(|arg| arg == "-v" || arg == "--verbose");
+    match positional.as_slice() {
+        [domain, server_ip] => Ok(Args {
             domain: domain.clone(),
             server_ip: server_ip.clone(),
+            verbose: !flags.is_empty(),
         }),
-        [prog, ..] => Err(format!("uso: {prog} <dominio> <ip_servidor_dns>")),
-        [] => unreachable!("argv sempre tem ao menos o nome do programa!"),
+        _ => Err(format!(
+            "uso: {prog} <dominio> <ip_servidor_dns> [-v|--verbose]"
+        )),
     }
 }
 
@@ -82,7 +97,7 @@ fn main() -> ExitCode {
     let mut cache = match DnsCache::open_default() {
         Ok(cache) => cache,
         Err(error) => {
-            eprintln!("[debug] cache DNS indisponivel: {error}");
+            debug_log!(args, "[debug] cache DNS indisponivel: {error}");
             None
         }
     };
@@ -90,7 +105,7 @@ fn main() -> ExitCode {
         .as_mut()
         .and_then(|cache| cache.get(&args.domain, QTYPE_MX, unix_time_now()))
     {
-        eprintln!("[debug] resposta obtida do cache DNS");
+        debug_log!(args, "[debug] resposta obtida do cache DNS");
         println!("{} <> {exchange}", args.domain);
         return ExitCode::SUCCESS;
     }
@@ -103,7 +118,8 @@ fn main() -> ExitCode {
         }
     };
 
-    eprintln!(
+    debug_log!(
+        args,
         "[debug] servidor={} txid=0x{id:04x} pacote ({} bytes): {}",
         args.server_ip,
         packet.len(),
@@ -118,7 +134,7 @@ fn main() -> ExitCode {
     // Reenvia o mesmo pacote e TXID: simplifica a correlacao e segue o padrao
     // comum de resolvers; um novo TXID evitaria aceitar respostas atrasadas.
     for attempt in 1..=3 {
-        eprintln!("[debug] tentativa {attempt}/3");
+        debug_log!(args, "[debug] tentativa {attempt}/3");
         if let Err(e) = socket.send_to(&packet, server) {
             eprintln!("falha ao enviar consulta DNS: {e}");
             return ExitCode::FAILURE;
@@ -150,7 +166,10 @@ fn main() -> ExitCode {
                     }
 
                     let response_packet = if header.is_truncated() {
-                        eprintln!("[debug] resposta UDP truncada; repetindo consulta via TCP");
+                        debug_log!(
+                            args,
+                            "[debug] resposta UDP truncada; repetindo consulta via TCP"
+                        );
                         match query_over_tcp(server, &packet) {
                             Ok(response) => response,
                             Err(error) => {
@@ -165,12 +184,15 @@ fn main() -> ExitCode {
                     let header = match Header::from_bytes(&response_packet) {
                         Ok(header) => header,
                         Err(error) => {
-                            eprintln!("[debug] resposta DNS via TCP malformada: {error}");
+                            debug_log!(args, "[debug] resposta DNS via TCP malformada: {error}");
                             return ExitCode::FAILURE;
                         }
                     };
                     if header.id != id || (header.flags & 0x8000) == 0 {
-                        eprintln!("[debug] resposta DNS via TCP nao corresponde a consulta");
+                        debug_log!(
+                            args,
+                            "[debug] resposta DNS via TCP nao corresponde a consulta"
+                        );
                         return ExitCode::FAILURE;
                     }
                     if header.rcode() == 3 {
@@ -192,7 +214,8 @@ fn main() -> ExitCode {
                                     unix_time_now(),
                                 )
                             {
-                                eprintln!(
+                                debug_log!(
+                                    args,
                                     "[debug] nao foi possivel atualizar o cache DNS: {error}"
                                 );
                             }
@@ -204,7 +227,7 @@ fn main() -> ExitCode {
                             return ExitCode::FAILURE;
                         }
                         Err(error) => {
-                            eprintln!("[debug] resposta DNS malformada: {error}");
+                            debug_log!(args, "[debug] resposta DNS malformada: {error}");
                             continue;
                         }
                     }
