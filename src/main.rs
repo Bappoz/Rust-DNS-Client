@@ -7,14 +7,15 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use dns::cache::{DnsCache, unix_time_now};
-use dns::message::QTYPE_MX;
-use dns::message::{Header, Question, parse_mx_answer};
+use dns::message::{Header, Question, RecordType, parse_answers};
 use dns::txid::Rng;
 
 struct Args {
     domain: String,
     server_ip: String,
     verbose: bool,
+    backoff: bool,
+    record_type: RecordType,
 }
 
 // Logs de diagnostico so aparecem com -v/--verbose; erros reais usam eprintln! direto.
@@ -48,18 +49,51 @@ fn query_over_tcp(server: SocketAddr, packet: &[u8]) -> std::io::Result<Vec<u8>>
 fn parse_args() -> Result<Args, String> {
     let mut argv = env::args();
     let prog = argv.next().unwrap_or_else(|| "my-client".to_string());
-    let (flags, positional): (Vec<String>, Vec<String>) =
-        argv.partition(|arg| arg == "-v" || arg == "--verbose");
+    parse_args_from(prog, argv)
+}
+
+fn parse_args_from(prog: String, argv: impl Iterator<Item = String>) -> Result<Args, String> {
+    let usage = format!(
+        "uso: {prog} <dominio> <ip_servidor_dns> [-v|--verbose] [--backoff] [--type <A|AAAA|CNAME|NS|TXT|MX>]"
+    );
+    let mut verbose = false;
+    let mut backoff = false;
+    let mut record_type = RecordType::MX;
+    let mut positional = Vec::new();
+    let mut argv = argv.peekable();
+
+    while let Some(argument) = argv.next() {
+        match argument.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            "--backoff" => backoff = true,
+            "--type" => {
+                let value = argv.next().ok_or_else(|| usage.clone())?;
+                record_type = value.parse()?;
+            }
+            _ => positional.push(argument),
+        }
+    }
+
     match positional.as_slice() {
         [domain, server_ip] => Ok(Args {
             domain: domain.clone(),
             server_ip: server_ip.clone(),
-            verbose: !flags.is_empty(),
+            verbose,
+            backoff,
+            record_type,
         }),
-        _ => Err(format!(
-            "uso: {prog} <dominio> <ip_servidor_dns> [-v|--verbose]"
-        )),
+        _ => Err(usage),
     }
+}
+
+fn retry_timeout(backoff: bool, attempt: usize) -> Duration {
+    let seconds = match (backoff, attempt) {
+        (false, _) => 2,
+        (true, 1) => 1,
+        (true, 2) => 2,
+        (true, _) => 4,
+    };
+    Duration::from_secs(seconds)
 }
 
 fn main() -> ExitCode {
@@ -84,7 +118,12 @@ fn main() -> ExitCode {
     let header = Header::new_query(id);
 
     let mut packet = header.to_bytes().to_vec();
-    packet.extend_from_slice(&question.to_bytes());
+    let question_bytes = if args.record_type == RecordType::MX {
+        question.to_bytes()
+    } else {
+        question.to_bytes_for(args.record_type)
+    };
+    packet.extend_from_slice(&question_bytes);
 
     let server = match format!("{}:53", args.server_ip).parse::<SocketAddr>() {
         Ok(addr) => addr,
@@ -101,9 +140,10 @@ fn main() -> ExitCode {
             None
         }
     };
-    if let Some(exchange) = cache
-        .as_mut()
-        .and_then(|cache| cache.get(&args.domain, QTYPE_MX, unix_time_now()))
+    if args.record_type == RecordType::MX
+        && let Some(exchange) = cache
+            .as_mut()
+            .and_then(|cache| cache.get(&args.domain, args.record_type.code(), unix_time_now()))
     {
         debug_log!(args, "[debug] resposta obtida do cache DNS");
         println!("{} <> {exchange}", args.domain);
@@ -135,12 +175,18 @@ fn main() -> ExitCode {
     // comum de resolvers; um novo TXID evitaria aceitar respostas atrasadas.
     for attempt in 1..=3 {
         debug_log!(args, "[debug] tentativa {attempt}/3");
+        let timeout = retry_timeout(args.backoff, attempt);
+        debug_log!(
+            args,
+            "[debug] timeout da tentativa {attempt}/3: {}ms",
+            timeout.as_millis()
+        );
         if let Err(e) = socket.send_to(&packet, server) {
             eprintln!("falha ao enviar consulta DNS: {e}");
             return ExitCode::FAILURE;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -203,28 +249,44 @@ fn main() -> ExitCode {
                         continue;
                     }
 
-                    match parse_mx_answer(&response_packet, &header) {
-                        Ok(Some(answer)) => {
-                            if let Some(cache) = cache.as_mut()
-                                && let Err(error) = cache.insert(
-                                    &args.domain,
-                                    QTYPE_MX,
-                                    answer.exchange.clone(),
-                                    answer.ttl,
-                                    unix_time_now(),
-                                )
-                            {
-                                debug_log!(
-                                    args,
-                                    "[debug] nao foi possivel atualizar o cache DNS: {error}"
-                                );
-                            }
-                            println!("{} <> {}", args.domain, answer.exchange);
-                            return ExitCode::SUCCESS;
-                        }
-                        Ok(None) => {
-                            println!("Dominio {} nao possui entrada MX", args.domain);
+                    match parse_answers(&response_packet, &header, args.record_type) {
+                        Ok(answers) if answers.is_empty() => {
+                            println!(
+                                "Dominio {} nao possui entrada {}",
+                                args.domain,
+                                args.record_type.label()
+                            );
                             return ExitCode::FAILURE;
+                        }
+                        Ok(answers) => {
+                            if args.record_type == RecordType::MX {
+                                let answer = &answers[0];
+                                if let Some(cache) = cache.as_mut()
+                                    && let Err(error) = cache.insert(
+                                        &args.domain,
+                                        args.record_type.code(),
+                                        answer.value.clone(),
+                                        answer.ttl,
+                                        unix_time_now(),
+                                    )
+                                {
+                                    debug_log!(
+                                        args,
+                                        "[debug] nao foi possivel atualizar o cache DNS: {error}"
+                                    );
+                                }
+                                println!("{} <> {}", args.domain, answer.value);
+                            } else {
+                                for answer in answers {
+                                    println!(
+                                        "{} {} {}",
+                                        args.domain,
+                                        args.record_type.label(),
+                                        answer.value
+                                    );
+                                }
+                            }
+                            return ExitCode::SUCCESS;
                         }
                         Err(error) => {
                             debug_log!(args, "[debug] resposta DNS malformada: {error}");
@@ -252,6 +314,83 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn retry_timeout_uses_fixed_default_and_optional_backoff() {
+        let fixed_timeout = Duration::from_secs(2);
+        for attempt in 1..=3 {
+            assert_eq!(retry_timeout(false, attempt), fixed_timeout);
+        }
+
+        assert_eq!(retry_timeout(true, 1), Duration::from_secs(1));
+        assert_eq!(retry_timeout(true, 2), Duration::from_secs(2));
+        assert_eq!(retry_timeout(true, 3), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn backoff_flag_is_optional_and_accepted_in_any_position() {
+        let default_args = parse_args_from(
+            "my-client".into(),
+            vec!["unb.br".into(), "8.8.8.8".into()].into_iter(),
+        )
+        .unwrap();
+        assert!(!default_args.backoff);
+
+        for arguments in [
+            vec!["--backoff".into(), "unb.br".into(), "8.8.8.8".into()],
+            vec!["unb.br".into(), "--backoff".into(), "8.8.8.8".into()],
+            vec!["unb.br".into(), "8.8.8.8".into(), "--backoff".into()],
+        ] {
+            let args = parse_args_from("my-client".into(), arguments.into_iter()).unwrap();
+            assert!(args.backoff);
+        }
+    }
+
+    #[test]
+    fn record_type_flag_defaults_to_mx_and_accepts_supported_types() {
+        let default_args = parse_args_from(
+            "my-client".into(),
+            vec!["unb.br".into(), "8.8.8.8".into()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(default_args.record_type, RecordType::MX);
+
+        for (label, expected_type) in [
+            ("A", RecordType::A),
+            ("AAAA", RecordType::Aaaa),
+            ("CNAME", RecordType::Cname),
+            ("NS", RecordType::NS),
+            ("TXT", RecordType::Txt),
+            ("MX", RecordType::MX),
+        ] {
+            let args = parse_args_from(
+                "my-client".into(),
+                vec![
+                    "unb.br".into(),
+                    "8.8.8.8".into(),
+                    "--type".into(),
+                    label.into(),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+            assert_eq!(args.record_type, expected_type);
+        }
+
+        assert!(
+            parse_args_from(
+                "my-client".into(),
+                vec![
+                    "unb.br".into(),
+                    "8.8.8.8".into(),
+                    "--type".into(),
+                    "PTR".into()
+                ]
+                .into_iter(),
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn tcp_query_uses_dns_length_prefix() {
