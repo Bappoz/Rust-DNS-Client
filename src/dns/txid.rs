@@ -1,14 +1,18 @@
-// A server only for generating a transaction ID with low chance of trivial colision of previsibility
+/// Gerador pseudoaleatorio usado apenas para escolher o TXID das consultas.
+///
+/// Nao e criptograficamente seguro: o objetivo e reduzir colisao acidental, nao
+/// impedir que um atacante preveja o identificador.
 pub struct Rng {
     state: u64,
 }
 
 impl Rng {
-    // Minimal PRNG based on SplitMix64 (Virginia) -- Not full secure
+    /// Semeia com o relogio e o PID. Um relogio anterior a 1970 cai para zero,
+    /// o que so reduz a aleatoriedade da semente.
     pub fn seeded_from_clock() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("...")
+            .unwrap_or_default()
             .as_nanos() as u64;
         let pid = std::process::id() as u64;
         Rng {
@@ -24,6 +28,7 @@ impl Rng {
         z ^ (z >> 31)
     }
 
+    /// Proximo valor de 16 bits, adequado como TXID.
     pub fn next_u16(&mut self) -> u16 {
         (self.next_u64() >> 48) as u16
     }

@@ -42,6 +42,8 @@ pub struct DnsCache {
 }
 
 impl DnsCache {
+    /// Abre o cache no caminho padrao (`DNS_CLIENT_CACHE` ou o diretorio de
+    /// cache do usuario). Devolve `Ok(None)` quando nao ha caminho disponivel.
     pub fn open_default() -> io::Result<Option<Self>> {
         default_cache_path().map_or(Ok(None), |path| Self::open(path).map(Some))
     }
@@ -65,6 +67,8 @@ impl DnsCache {
         })
     }
 
+    /// Valor ainda valido para `domain` e `rr_type` no instante `now` (segundos
+    /// desde a epoca Unix). Entradas expiradas sao descartadas da memoria.
     pub fn get(&mut self, domain: &str, rr_type: u16, now: u64) -> Option<String> {
         self.entries.retain(|_, entry| entry.expires_at > now);
         self.entries
@@ -72,6 +76,8 @@ impl DnsCache {
             .map(|entry| entry.answer.clone())
     }
 
+    /// Guarda `answer` por `ttl` segundos a partir de `now` e grava o arquivo.
+    /// TTL zero nao e armazenado.
     pub fn insert(
         &mut self,
         domain: &str,
@@ -129,6 +135,7 @@ impl CacheKey {
     }
 }
 
+/// Segundos desde a epoca Unix; zero se o relogio estiver antes de 1970.
 pub fn unix_time_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

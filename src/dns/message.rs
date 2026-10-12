@@ -1,15 +1,18 @@
-use super::name::{ParseError, checked_offset, decode_name, encode_qname};
+use super::name::{NameError, ParseError, checked_offset, decode_name, encode_qname};
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-pub const QTYPE_A: u16 = 1;
-pub const QTYPE_NS: u16 = 2;
-pub const QTYPE_CNAME: u16 = 5;
-pub const QTYPE_MX: u16 = 15;
-pub const QTYPE_TXT: u16 = 16;
-pub const QTYPE_AAAA: u16 = 28;
-pub const QCLASS_IN: u16 = 1;
+// Codigos QTYPE/QCLASS de RFC 1035 §3.2.2 e §3.2.4.
+const QTYPE_A: u16 = 1;
+const QTYPE_NS: u16 = 2;
+const QTYPE_CNAME: u16 = 5;
+const QTYPE_MX: u16 = 15;
+const QTYPE_TXT: u16 = 16;
+const QTYPE_AAAA: u16 = 28;
+const QCLASS_IN: u16 = 1;
 
+/// Tipos de registro suportados pelo cliente.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     A,
@@ -21,6 +24,7 @@ pub enum RecordType {
 }
 
 impl RecordType {
+    /// Codigo numerico do tipo (QTYPE) usado no campo `TYPE` da pergunta e do RR.
     pub fn code(self) -> u16 {
         match self {
             Self::A => QTYPE_A,
@@ -32,6 +36,7 @@ impl RecordType {
         }
     }
 
+    /// Nome textual do tipo, como aceito por `--type` e exibido na saida.
     pub fn label(self) -> &'static str {
         match self {
             Self::A => "A",
@@ -44,8 +49,27 @@ impl RecordType {
     }
 }
 
+/// Texto que nao corresponde a nenhum [`RecordType`] suportado.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordTypeError {
+    pub input: String,
+}
+
+impl fmt::Display for RecordTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tipo DNS invalido: {} (use A, AAAA, CNAME, NS, TXT ou MX)",
+            self.input
+        )
+    }
+}
+
+impl std::error::Error for RecordTypeError {}
+
+/// Aceita o nome do tipo sem diferenciar maiusculas de minusculas.
 impl FromStr for RecordType {
-    type Err = String;
+    type Err = RecordTypeError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_uppercase().as_str() {
@@ -55,9 +79,9 @@ impl FromStr for RecordType {
             "MX" => Ok(Self::MX),
             "TXT" => Ok(Self::Txt),
             "AAAA" => Ok(Self::Aaaa),
-            _ => Err(format!(
-                "tipo DNS invalido: {value} (use A, AAAA, CNAME, NS, TXT ou MX)"
-            )),
+            _ => Err(RecordTypeError {
+                input: value.to_owned(),
+            }),
         }
     }
 }
@@ -66,7 +90,7 @@ impl FromStr for RecordType {
 /// RDATA no pacote original, necessario pois nomes dentro dele podem usar
 /// ponteiros de compressao.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceRecord {
+struct ResourceRecord {
     pub name: String,
     pub rr_type: u16,
     pub class: u16,
@@ -94,7 +118,7 @@ fn skip_questions(packet: &[u8], count: u16) -> Result<usize, ParseError> {
 }
 
 /// Le um Resource Record e devolve tambem o cursor logo apos seu RDATA.
-pub fn parse_resource_record(
+fn parse_resource_record(
     packet: &[u8],
     offset: usize,
 ) -> Result<(ResourceRecord, usize), ParseError> {
@@ -133,9 +157,12 @@ pub fn parse_resource_record(
     ))
 }
 
+/// Um valor extraido da secao Answer, ja decodificado para texto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordAnswer {
+    /// Representacao textual do RDATA (ex.: `192.0.2.1`, `mx.example.com`).
     pub value: String,
+    /// TTL em segundos, conforme anunciado pelo servidor.
     pub ttl: u32,
 }
 
@@ -258,22 +285,28 @@ fn format_txt_string(bytes: &[u8]) -> String {
     value
 }
 
+/// Secao Question de uma consulta: o QNAME ja codificado e o tipo pedido.
+// QNAME changes size according to the domain written
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
     qname: Vec<u8>,
 }
 
-// QNAME changes size according to the domain written
 impl Question {
-    pub fn new(domain: &str) -> Result<Self, String> {
+    /// Codifica `domain` em QNAME, convertendo labels IDN para Punycode.
+    /// Aceita um ponto final opcional.
+    pub fn new(domain: &str) -> Result<Self, NameError> {
         Ok(Question {
             qname: encode_qname(domain)?,
         })
     }
 
+    /// Bytes da pergunta para o tipo MX, o padrao historico do cliente.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.to_bytes_for(RecordType::MX)
     }
 
+    /// Bytes da pergunta (QNAME, QTYPE, QCLASS) para `record_type`.
     pub fn to_bytes_for(&self, record_type: RecordType) -> Vec<u8> {
         let mut buf = self.qname.clone();
         buf.extend_from_slice(&record_type.code().to_be_bytes());
@@ -282,7 +315,8 @@ impl Question {
     }
 }
 
-/// DNS message header
+/// Cabecalho de 12 bytes de uma mensagem DNS (RFC 1035 §4.1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     pub id: u16,      // 16 bits identifier
     pub flags: u16,   // responsible for response status and query behavior
@@ -292,14 +326,21 @@ pub struct Header {
     pub arcount: u16, // Number of additional registries
 }
 
-pub const FLAGS_RECURSIVE_QUERY: u16 = 0x0100;
-pub const FLAGS_TRUNCATED: u16 = 0x0200;
+const FLAG_RESPONSE: u16 = 0x8000;
+const FLAG_RECURSION_DESIRED: u16 = 0x0100;
+const FLAG_TRUNCATED: u16 = 0x0200;
+
+/// RCODE de sucesso.
+pub const RCODE_NO_ERROR: u16 = 0;
+/// RCODE de "nome nao existe" (NXDOMAIN).
+pub const RCODE_NXDOMAIN: u16 = 3;
 
 impl Header {
+    /// Cabecalho de consulta recursiva com uma unica pergunta.
     pub fn new_query(id: u16) -> Self {
         Header {
             id,
-            flags: FLAGS_RECURSIVE_QUERY,
+            flags: FLAG_RECURSION_DESIRED,
             qdcount: 0x0001,
             ancount: 0x0000,
             nscount: 0x0000,
@@ -307,6 +348,7 @@ impl Header {
         }
     }
 
+    /// Serializa o cabecalho em big-endian, na ordem do RFC 1035.
     pub fn to_bytes(&self) -> [u8; 12] {
         let mut buf = [0u8; 12];
         buf[0..2].copy_from_slice(&self.id.to_be_bytes());
@@ -318,6 +360,7 @@ impl Header {
         buf
     }
 
+    /// Le os 12 primeiros bytes de `bytes`. Nao valida os campos.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
         if bytes.len() < 12 {
             return Err(ParseError::TruncatedHeader {
@@ -335,12 +378,20 @@ impl Header {
         })
     }
 
+    /// Codigo de resposta (RCODE), ver [`RCODE_NO_ERROR`] e [`RCODE_NXDOMAIN`].
     pub fn rcode(&self) -> u16 {
         self.flags & 0x000F
     }
 
+    /// `true` quando o bit QR indica resposta, e nao consulta.
+    pub fn is_response(&self) -> bool {
+        self.flags & FLAG_RESPONSE != 0
+    }
+
+    /// `true` quando o servidor truncou a resposta (bit TC): o cliente deve
+    /// repetir a consulta por TCP.
     pub fn is_truncated(&self) -> bool {
-        self.flags & FLAGS_TRUNCATED != 0
+        self.flags & FLAG_TRUNCATED != 0
     }
 }
 
