@@ -2,6 +2,7 @@
 name = "my-client"
 version = "0.1.0"
 edition = "2024"
+# if-let encadeado (let chains) exige 1.88.
+rust-version = "1.88"
 
 [dependencies]
-idna = "1"

@@ -15,6 +15,8 @@ struct Args {
     server_ip: String,
     verbose: bool,
     backoff: bool,
+    cache: bool,
+    tcp: bool,
     record_type: RecordType,
 }
 
@@ -54,10 +56,12 @@ fn parse_args() -> Result<Args, String> {
 
 fn parse_args_from(prog: String, argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let usage = format!(
-        "uso: {prog} <dominio> <ip_servidor_dns> [-v|--verbose] [--backoff] [--type <A|AAAA|CNAME|NS|TXT|MX>]"
+        "uso: {prog} <dominio> <ip_servidor_dns> [-v|--verbose] [--backoff] [--cache] [--tcp] [--type <A|AAAA|CNAME|NS|TXT|MX>]"
     );
     let mut verbose = false;
     let mut backoff = false;
+    let mut cache = false;
+    let mut tcp = false;
     let mut record_type = RecordType::MX;
     let mut positional = Vec::new();
     let mut argv = argv.peekable();
@@ -66,6 +70,8 @@ fn parse_args_from(prog: String, argv: impl Iterator<Item = String>) -> Result<A
         match argument.as_str() {
             "-v" | "--verbose" => verbose = true,
             "--backoff" => backoff = true,
+            "--cache" => cache = true,
+            "--tcp" => tcp = true,
             "--type" => {
                 let value = argv.next().ok_or_else(|| usage.clone())?;
                 record_type = value
@@ -82,6 +88,8 @@ fn parse_args_from(prog: String, argv: impl Iterator<Item = String>) -> Result<A
             server_ip: server_ip.clone(),
             verbose,
             backoff,
+            cache,
+            tcp,
             record_type,
         }),
         _ => Err(usage),
@@ -96,6 +104,15 @@ fn retry_timeout(backoff: bool, attempt: usize) -> Duration {
         (true, _) => 4,
     };
     Duration::from_secs(seconds)
+}
+
+/// Mensagem de quando nenhuma resposta utilizavel chegou apos as tentativas.
+/// Para MX o texto e exatamente o do enunciado.
+fn no_response_message(domain: &str, record_type: RecordType) -> String {
+    format!(
+        "Nao foi possível coletar entrada {} para {domain}",
+        record_type.label()
+    )
 }
 
 fn main() -> ExitCode {
@@ -135,12 +152,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut cache = match DnsCache::open_default() {
-        Ok(cache) => cache,
-        Err(error) => {
-            debug_log!(args, "[debug] cache DNS indisponivel: {error}");
-            None
+    // O cache e opt-in: por padrao toda execucao envia a consulta ao servidor
+    // informado, como pede o enunciado. A chave do cache nao inclui o servidor.
+    let mut cache = if args.cache {
+        match DnsCache::open_default() {
+            Ok(cache) => cache,
+            Err(error) => {
+                debug_log!(args, "[debug] cache DNS indisponivel: {error}");
+                None
+            }
         }
+    } else {
+        None
     };
     if args.record_type == RecordType::MX
         && let Some(exchange) = cache
@@ -213,7 +236,9 @@ fn main() -> ExitCode {
                         continue;
                     }
 
-                    let response_packet = if header.is_truncated() {
+                    // Por padrao o transporte e somente UDP; o TCP so entra com --tcp.
+                    let truncated_udp = header.is_truncated() && !args.tcp;
+                    let response_packet = if header.is_truncated() && args.tcp {
                         debug_log!(
                             args,
                             "[debug] resposta UDP truncada; repetindo consulta via TCP"
@@ -252,6 +277,19 @@ fn main() -> ExitCode {
                     }
 
                     match parse_answers(&response_packet, &header, args.record_type) {
+                        // Um datagrama truncado pode ter perdido justamente o
+                        // registro pedido: sem ele nao ha como afirmar que a
+                        // entrada nao existe.
+                        Ok(answers) if answers.is_empty() && truncated_udp => {
+                            eprintln!("resposta truncada pelo servidor (bit TC); repita com --tcp");
+                            println!("{}", no_response_message(&args.domain, args.record_type));
+                            return ExitCode::FAILURE;
+                        }
+                        Err(_) if truncated_udp => {
+                            eprintln!("resposta truncada pelo servidor (bit TC); repita com --tcp");
+                            println!("{}", no_response_message(&args.domain, args.record_type));
+                            return ExitCode::FAILURE;
+                        }
                         Ok(answers) if answers.is_empty() => {
                             println!(
                                 "Dominio {} nao possui entrada {}",
@@ -307,7 +345,7 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("Nao foi possível coletar entrada MX para {}", args.domain);
+    println!("{}", no_response_message(&args.domain, args.record_type));
     ExitCode::FAILURE
 }
 
@@ -346,6 +384,43 @@ mod tests {
             let args = parse_args_from("my-client".into(), arguments.into_iter()).unwrap();
             assert!(args.backoff);
         }
+    }
+
+    #[test]
+    fn cache_and_tcp_are_disabled_unless_requested() {
+        let default_args = parse_args_from(
+            "my-client".into(),
+            vec!["unb.br".into(), "8.8.8.8".into()].into_iter(),
+        )
+        .unwrap();
+        assert!(!default_args.cache);
+        assert!(!default_args.tcp);
+
+        let args = parse_args_from(
+            "my-client".into(),
+            vec![
+                "unb.br".into(),
+                "--cache".into(),
+                "8.8.8.8".into(),
+                "--tcp".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert!(args.cache);
+        assert!(args.tcp);
+    }
+
+    #[test]
+    fn no_response_message_matches_assignment_text_for_mx() {
+        assert_eq!(
+            no_response_message("unb.br", RecordType::MX),
+            "Nao foi possível coletar entrada MX para unb.br"
+        );
+        assert_eq!(
+            no_response_message("unb.br", RecordType::A),
+            "Nao foi possível coletar entrada A para unb.br"
+        );
     }
 
     #[test]
