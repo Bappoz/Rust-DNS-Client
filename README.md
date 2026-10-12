@@ -18,9 +18,9 @@ Trabalho feito em trio.
 
 | Nome | Matrícula |
 | --- | --- |
+| Giovanna Felipe Guimarães | 241038998 |
 | Lucas Andrade Zanetti | 241039645 |
-| Matheus Eiki | |
-| Giovanna Felipe | |
+| Matheus Eiki | 241025327 |
 
 ## 1. Sistema operacional
 
