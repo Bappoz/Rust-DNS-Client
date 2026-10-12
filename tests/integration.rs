@@ -11,16 +11,26 @@ const PUBLIC_RESOLVER: &str = "8.8.8.8";
 // TEST-NET-1 (RFC 5737): nunca roteado, entao nenhum servidor responde.
 const UNREACHABLE_SERVER: &str = "192.0.2.1";
 
+const CACHED_EXCHANGE: &str = "mx.cache.test";
+
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Executa o binario com um cache isolado, para que o resultado nao dependa de
 /// execucoes anteriores nem contamine o cache do usuario.
 fn run_client(args: &[&str]) -> Output {
+    run_client_with_cache(args, None)
+}
+
+/// Como `run_client`, mas grava `seed` no arquivo de cache antes de executar.
+fn run_client_with_cache(args: &[&str], seed: Option<&str>) -> Output {
     let cache: PathBuf = std::env::temp_dir().join(format!(
         "dns-client-it-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
+    if let Some(contents) = seed {
+        std::fs::write(&cache, contents).expect("falha ao gravar o cache de teste");
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_my-client"))
         .args(args)
         .env("DNS_CLIENT_CACHE", &cache)
@@ -28,6 +38,18 @@ fn run_client(args: &[&str]) -> Output {
         .expect("falha ao executar o binario");
     let _ = std::fs::remove_file(&cache);
     output
+}
+
+/// Arquivo de cache com uma entrada MX de `unb.br` que nunca expira, no
+/// formato gravado por `DnsCache` (dominio e resposta em hexadecimal).
+fn cache_with_unb_mx() -> String {
+    let hex = |text: &str| text.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "dns-cache-v1\n{}\t15\t{}\t{}\n",
+        u64::MAX,
+        hex("unb.br"),
+        hex(CACHED_EXCHANGE)
+    )
 }
 
 fn stdout(output: &Output) -> String {
@@ -102,6 +124,31 @@ fn server_does_not_answer() {
         stdout(&output),
         "Nao foi possível coletar entrada MX para unb.br\n"
     );
+}
+
+// Regressao: o exemplo 4 do enunciado, executado depois do exemplo 1, devolvia
+// a resposta guardada em vez de consultar o servidor informado.
+#[test]
+#[ignore = "requer rede"]
+fn cache_is_not_used_without_the_cache_flag() {
+    let seed = cache_with_unb_mx();
+    let output = run_client_with_cache(&["unb.br", UNREACHABLE_SERVER], Some(&seed));
+
+    assert!(!output.status.success());
+    assert_eq!(
+        stdout(&output),
+        "Nao foi possível coletar entrada MX para unb.br\n"
+    );
+}
+
+// Nao depende de rede: a resposta vem do arquivo de cache.
+#[test]
+fn cache_flag_reuses_a_stored_answer() {
+    let seed = cache_with_unb_mx();
+    let output = run_client_with_cache(&["unb.br", UNREACHABLE_SERVER, "--cache"], Some(&seed));
+
+    assert!(output.status.success());
+    assert_eq!(stdout(&output), format!("unb.br <> {CACHED_EXCHANGE}\n"));
 }
 
 #[test]
