@@ -111,7 +111,7 @@ pub(crate) fn checked_offset(offset: usize, length: usize) -> Result<usize, Pars
 /// O segundo elemento retornado e o primeiro byte apos o nome na representacao
 /// original. Assim, ao seguir um ponteiro, o cursor retornado fica logo apos os
 /// dois bytes do ponteiro, e nao apos o nome para o qual ele aponta.
-pub fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), ParseError> {
+pub(crate) fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), ParseError> {
     if offset >= packet.len() {
         return Err(ParseError::OffsetOutOfBounds { offset });
     }
@@ -186,16 +186,43 @@ pub fn decode_name(packet: &[u8], offset: usize) -> Result<(String, usize), Pars
     }
 }
 
-/// Codifica um dominio no formato de labels do DNS (RFC 10135)
-/// cada label prefixado por 1 byte de tamanho (0-63)
-/// tamanho limitado a 63 já que 2 bits mais altos do byte de tamanho sao reservados
-pub fn encode_qname(domain: &str) -> Result<Vec<u8>, String> {
+/// Erros encontrados ao codificar um dominio em QNAME.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameError {
+    InvalidLabel { label: String, reason: String },
+    LabelTooLong { label: String },
+}
+
+impl fmt::Display for NameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLabel { label, reason } => {
+                write!(f, "label '{label}' invalido para IDN: {reason}")
+            }
+            Self::LabelTooLong { label } => {
+                write!(f, "label '{label}' excede 63 bytes após Punycode")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
+
+/// Codifica um dominio no formato de labels do DNS (RFC 1035 §3.1): cada label
+/// e precedida por 1 byte com seu tamanho. O tamanho fica limitado a 63 porque
+/// os 2 bits mais altos do byte sao reservados para ponteiros de compressao.
+pub(crate) fn encode_qname(domain: &str) -> Result<Vec<u8>, NameError> {
     let mut out = Vec::new();
     for label in domain.split('.').filter(|s| !s.is_empty()) {
-        let ascii_label = idna::domain_to_ascii(label)
-            .map_err(|error| format!("label '{label}' invalido para IDN: {error}"))?;
+        let ascii_label =
+            idna::domain_to_ascii(label).map_err(|error| NameError::InvalidLabel {
+                label: label.to_owned(),
+                reason: error.to_string(),
+            })?;
         if ascii_label.len() > 63 {
-            return Err(format!("label '{label}' excede 63 bytes após Punycode"));
+            return Err(NameError::LabelTooLong {
+                label: label.to_owned(),
+            });
         }
         out.push(ascii_label.len() as u8);
         out.extend_from_slice(ascii_label.as_bytes());

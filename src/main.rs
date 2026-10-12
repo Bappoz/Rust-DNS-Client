@@ -1,14 +1,14 @@
-mod dns;
-
 use std::env;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use dns::cache::{DnsCache, unix_time_now};
-use dns::message::{Header, Question, RecordType, parse_answers};
-use dns::txid::Rng;
+use my_client::dns::cache::{DnsCache, unix_time_now};
+use my_client::dns::message::{
+    Header, Question, RCODE_NO_ERROR, RCODE_NXDOMAIN, RecordType, RecordTypeError, parse_answers,
+};
+use my_client::dns::txid::Rng;
 
 struct Args {
     domain: String,
@@ -68,7 +68,9 @@ fn parse_args_from(prog: String, argv: impl Iterator<Item = String>) -> Result<A
             "--backoff" => backoff = true,
             "--type" => {
                 let value = argv.next().ok_or_else(|| usage.clone())?;
-                record_type = value.parse()?;
+                record_type = value
+                    .parse()
+                    .map_err(|error: RecordTypeError| error.to_string())?;
             }
             _ => positional.push(argument),
         }
@@ -207,7 +209,7 @@ fn main() -> ExitCode {
                         Ok(header) => header,
                         Err(_) => continue,
                     };
-                    if header.id != id || (header.flags & 0x8000) == 0 {
+                    if header.id != id || !header.is_response() {
                         continue;
                     }
 
@@ -234,18 +236,18 @@ fn main() -> ExitCode {
                             return ExitCode::FAILURE;
                         }
                     };
-                    if header.id != id || (header.flags & 0x8000) == 0 {
+                    if header.id != id || !header.is_response() {
                         debug_log!(
                             args,
                             "[debug] resposta DNS via TCP nao corresponde a consulta"
                         );
                         return ExitCode::FAILURE;
                     }
-                    if header.rcode() == 3 {
+                    if header.rcode() == RCODE_NXDOMAIN {
                         println!("Dominio {} nao encontrado", args.domain);
                         return ExitCode::FAILURE;
                     }
-                    if header.rcode() != 0 {
+                    if header.rcode() != RCODE_NO_ERROR {
                         continue;
                     }
 
